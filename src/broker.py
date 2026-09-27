@@ -3,19 +3,33 @@ Starts/stops the Eclipse Mosquitto broker (EPL-2.0/EDL) in a podman
 container, bound to 127.0.0.1 on a random free port. Used by scripts and by
 the pytest fixtures - never touches any other container on the host.
 
-Ownership: containers this module creates are labelled OWNER_LABEL_KEY=
-OWNER_LABEL_VALUE. start_broker() only ever force-removes a pre-existing
-container of the same name if that container carries this exact label
-(i.e. it is a stale leftover from a previous run of this same demo). If a
-container with the target name exists and is NOT labelled as ours, it is
-left untouched and a RuntimeError is raised instead - it is never blindly
-`podman rm -f`'d, since it might belong to something else on the host.
+Ownership and run isolation: containers this module creates are labelled
+OWNER_LABEL_KEY=OWNER_LABEL_VALUE (this demo, as a project) AND
+RUN_ID_LABEL_KEY=<this process's RUN_ID> (this specific run). If a
+container with the target name exists and is NOT project-labelled, it is
+left untouched and a RuntimeError is raised - it is never blindly
+`podman rm -f`'d, since it might belong to something else on the host
+(unchanged from before). If it IS project-labelled but its run-id label
+does not match this process's RUN_ID, it belongs to a *different* (possibly
+still-active) run of this same demo - start_broker() refuses to touch it
+rather than silently killing another run just because the default name
+collided; pass an explicit unique `name` (see `unique_name()`) to isolate
+concurrent runs instead. Only when the run-id label matches this process's
+own RUN_ID (i.e. an earlier, uncommitted call from this exact run/process)
+is it treated as this run's own stale leftover and replaced. This is a
+narrowed claim: two *separate processes* that both explicitly reuse the
+same fixed name (e.g. two manual `python3 src/broker.py` invocations
+without ever isolating names) are still two different runs by this
+module's definition and will correctly refuse each other, not race.
+`tests/conftest.py`'s pytest fixture always passes a fresh unique name so
+test runs never depend on this collision handling at all.
 """
 from __future__ import annotations
 
 import socket
 import subprocess
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,6 +38,20 @@ CONTAINER_NAME = "plant-oee-demo-mosquitto"
 IMAGE = "docker.io/library/eclipse-mosquitto:2"
 OWNER_LABEL_KEY = "com.plant-oee-demo.owner"
 OWNER_LABEL_VALUE = "plant-shift-oee-report"
+RUN_ID_LABEL_KEY = "com.plant-oee-demo.run-id"
+# One UUID per process/import - identifies "this run" for the ownership
+# check above. Two separate `python3 ...` invocations (even of the same
+# script) get different RUN_IDs; a single process reusing the same name
+# twice (e.g. the crash-recovery test below) keeps the same RUN_ID.
+RUN_ID = uuid.uuid4().hex[:12]
+
+
+def unique_name(prefix: str = CONTAINER_NAME) -> str:
+    """A fresh container name for a fully name-isolated run - never
+    collides with any other run's container, so start_broker() never even
+    reaches the ownership-collision logic above. Used by
+    tests/conftest.py."""
+    return f"{prefix}-{uuid.uuid4().hex[:8]}"
 
 
 def _free_port() -> int:
@@ -39,12 +67,12 @@ class Broker:
     container_name: str
 
 
-def _owner_label(name: str) -> str | None:
-    """Return the OWNER_LABEL_KEY value of an existing container named
+def _label(name: str, key: str) -> str | None:
+    """Return the given label's value on an existing container named
     `name`, or None if no such container exists. Never raises for a
     missing container."""
     r = subprocess.run(
-        ["podman", "inspect", "--format", f"{{{{ index .Config.Labels \"{OWNER_LABEL_KEY}\" }}}}", name],
+        ["podman", "inspect", "--format", f"{{{{ index .Config.Labels \"{key}\" }}}}", name],
         capture_output=True, text=True,
     )
     if r.returncode != 0:
@@ -52,11 +80,30 @@ def _owner_label(name: str) -> str | None:
     return r.stdout.strip()
 
 
+def _owner_label(name: str) -> str | None:
+    return _label(name, OWNER_LABEL_KEY)
+
+
 def start_broker(name: str = CONTAINER_NAME, port: int | None = None) -> Broker:
     owner = _owner_label(name)
     if owner is not None:
         if owner == OWNER_LABEL_VALUE:
-            stop_broker(name)  # stale leftover from a previous run of this same demo
+            run_id = _label(name, RUN_ID_LABEL_KEY)
+            if run_id == RUN_ID:
+                # Stale leftover from an earlier call within this exact
+                # run/process (e.g. a previous start_broker() that was
+                # never stopped) - safe to replace.
+                stop_broker(name)
+            else:
+                raise RuntimeError(
+                    f"podman container {name!r} already exists, is owned by this demo "
+                    f"({OWNER_LABEL_KEY}={owner!r}), but belongs to a DIFFERENT run "
+                    f"({RUN_ID_LABEL_KEY}={run_id!r} != this run's {RUN_ID!r}) - it may "
+                    "still be active. Refusing to remove another run's container just "
+                    "because the name collided. Pass a unique `name` (see "
+                    "`broker.unique_name()`) to isolate concurrent runs, or stop that "
+                    f"other run yourself first if you're sure it's done: `podman rm -f {name}`."
+                )
         else:
             raise RuntimeError(
                 f"podman container {name!r} already exists and is not owned by this "
@@ -71,6 +118,7 @@ def start_broker(name: str = CONTAINER_NAME, port: int | None = None) -> Broker:
             "podman", "run", "-d", "--rm",
             "--name", name,
             "--label", f"{OWNER_LABEL_KEY}={OWNER_LABEL_VALUE}",
+            "--label", f"{RUN_ID_LABEL_KEY}={RUN_ID}",
             "-p", f"127.0.0.1:{port}:1883",
             "-v", f"{CONF_PATH}:/mosquitto/config/mosquitto.conf:ro,Z",
             IMAGE,

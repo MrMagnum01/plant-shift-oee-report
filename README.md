@@ -98,19 +98,37 @@ quarantined messages keep their raw payload so they can be inspected later.
 |---|---|---|
 | `accepted` | Passed grammar/type/tag checks, in chronological order for its tag | yes |
 | `accepted_late` | Valid, but older than the tag's latest accepted timestamp by no more than the late-grace window (5 min) | yes, flagged `is_late` |
-| `duplicate` | Same `seq` already ingested | no |
+| `duplicate` | Same `seq` already ingested, with the same content (see below) | no |
+| `seq_conflict` | Same `seq` already ingested, but with **different** content (content-hash mismatch) - a conflict, not a duplicate | no, quarantined with raw payload; the original fact row is left untouched |
 | `out_of_order_rejected` | Valid, but older than the tag's latest accepted timestamp by more than the grace window | no, quarantined with raw payload |
-| `alarm_out_of_order_rejected` | ALARM message whose phase doesn't follow the last accepted phase for that (machine, alarm_code) - e.g. two RAISEs in a row, or a CLEAR with no open RAISE | no, quarantined with raw payload |
+| `alarm_out_of_order_rejected` | ALARM message whose phase doesn't follow the last accepted phase for that (machine, alarm_code), OR whose ts precedes the last accepted event's ts for that pair - e.g. two RAISEs in a row, a CLEAR with no open RAISE, or a CLEAR timestamped before its RAISE | no, quarantined with raw payload |
 | `unknown_tag` | `tag` is not one of the three known machines | no, quarantined |
 | `bad_payload` | Invalid JSON, missing/mistyped field, an invalid enum value (state/phase/etc.), or a scalar field (seq/state/phase/good_delta/...) that is the wrong JSON type (list/object) or out of range | no, quarantined |
 
+**Duplicate vs seq_conflict**: durable event identity is bound to
+`(seq, content)`, not `seq` alone. Every accepted/accepted_late/rejected
+message has a sha256 content hash stored against its `seq`
+(`ingest_log.content_hash`, reconstructed on restart the same way
+`seen_seq` is). A later message under an already-seen `seq` is a
+`duplicate` only if its content hash matches; different content under the
+same `seq` is a `seq_conflict` - logged as evidence, never re-applied, and
+the original fact row is never overwritten.
+
 **Alarm sequencing**: for a given `(machine, alarm_code)`, phases must
-strictly alternate RAISE, CLEAR, RAISE, CLEAR, ... The ingester enforces
-this and rejects (`alarm_out_of_order_rejected`) anything that breaks the
-alternation, rather than silently treating the next RAISE as an implicit
-CLEAR of the previous one. `report.py`'s alarm summary relies on this: it
-pairs each RAISE with "the next event for that (machine, code)" and is only
-correct because the ingester guarantees that pairing is always well-formed.
+strictly alternate RAISE, CLEAR, RAISE, CLEAR, ... **and** each event's ts
+must not precede the ts of the last accepted event for that same pair - the
+ingester enforces both together, so RAISE/CLEAR identity is established at
+ingest time by event timestamp, not by receipt/arrival order. It rejects
+(`alarm_out_of_order_rejected`) anything that breaks either check, rather
+than silently treating the next RAISE as an implicit CLEAR of the previous
+one, or pairing a CLEAR with a RAISE it doesn't chronologically belong to.
+`report.py`'s alarm summary relies on this: it pairs each RAISE with "the
+next event for that (machine, code)" by ts, and is only correct because the
+ingester guarantees every ts-ordered, phase-alternating sequence it admits
+is already in true RAISE/CLEAR pairing order. A RAISE with no following
+CLEAR (either genuinely still open, or its CLEAR was rejected) is reported
+as an explicit `open_count`, not folded into an indistinguishable
+zero-duration pair.
 
 A **clock gap** is recorded in `clock_gaps` (separately from the category
 above) whenever an accepted message's timestamp is more than 10 minutes
@@ -160,6 +178,21 @@ specific to this demo's single synthetic stream's sequence numbering (see
 `events.py`) - it is not a claim that sequence numbers are safe to reuse
 across multiple independent publishers or days.
 
+**Write-failure recovery**: a message's in-memory dedup/watermark/alarm
+state is updated together with its durable writes, but if any of those
+writes raises (e.g. the fact `INSERT` itself fails) *after* the in-memory
+update, `handle_raw` rolls back the open DuckDB transaction and rebuilds
+**every** piece of in-memory state (`seen_seq`, `seq_hash`, per-tag
+watermarks, per-alarm phase state, `stats`) from what DuckDB actually has
+committed, then re-raises. This discards the same uncommitted batch tail a
+hard crash would discard - never a state that is ahead of the database. A
+retry of the same message after such a failure is therefore evaluated
+against reality and is accepted, not permanently lost as a phantom
+duplicate. Verified in `tests/test_rereview_fixes.py` by injecting a
+failure into the `count_ticks` INSERT (directly, and mid-batch after other
+messages were already accepted-but-uncommitted) and asserting a retry -
+and the batch predecessors - are accepted.
+
 ## Atomic publish (per file, not per report-set)
 
 `report.py` writes the HTML and the JSON report **each** to its own temp
@@ -186,15 +219,42 @@ concurrently-writing ingester.
 ## Completeness
 
 Each machine/shift's `availability`/`performance`/`quality`/`oee` are only
-computed when its STATE telemetry fully covers the shift window (RUN + DOWN
-+ IDLE seconds equal the planned production time, within a small
-tolerance). If telemetry is missing or partial for a machine/shift - e.g. an
-empty database, or a machine that never reported - those fields are
-withheld (`null` in the JSON) rather than computed from a hole in the
-timeline and reported as an ordinary-looking zero. `data["completeness"]`
-gives the whole-report rollup (`all_complete` plus a list of the specific
-incomplete machine/shift rows with a reason), and the rendered HTML banners
-the report and marks each incomplete cell "incomplete" instead of a number.
+computed when **both** legs of the coverage rule below hold - STATE tiling
+alone is not enough:
+
+1. **STATE coverage**: STATE telemetry fully covers the shift window (RUN +
+   DOWN + IDLE seconds equal the planned production time, within a small
+   tolerance).
+2. **COUNT coverage**: whenever that tiling reports `run_seconds > 0`,
+   actual COUNT telemetry (`good_delta + reject_delta`, summed within the
+   window) must reach at least 50% (`MIN_COUNT_COVERAGE_FRACTION` in
+   `report.py`) of the production ticks that run time implies at the
+   machine's ideal cycle time (`run_seconds / ideal_cycle_seconds`). If
+   `run_seconds == 0`, no COUNT evidence is required.
+
+Leg 2 exists specifically because leg 1 alone can be satisfied by
+extrapolation: `_state_seconds()` extends a STATE event's segment to the
+next STATE event, or to the shift's end if there isn't one
+(`lead()`/`COALESCE` in the SQL) - so a single RUN report and nothing else
+tiles the *entire* window on its own, reporting a numerically "full"
+`run_seconds` with zero corroborating production evidence. Leg 2 catches
+that: RUN time claimed but not backed by any counts.
+
+If either leg fails - e.g. an empty database, a machine that never
+reported, or a machine reporting RUN with no counts - the derived fields
+are withheld (`null` in the JSON) rather than computed from a hole (or an
+unproven claim) in the timeline and reported as an ordinary-looking zero.
+`data["completeness"]` gives the whole-report rollup (`all_complete` plus a
+list of the specific incomplete machine/shift rows with a reason that names
+which leg failed), and the rendered HTML banners the report and marks each
+incomplete cell "incomplete" instead of a number.
+
+This is a coarse corroboration check, not a re-derivation of performance -
+performance itself is computed from the actual counts once a machine/shift
+is complete. The 50% floor is deliberately generous: it comfortably passes
+real dense synthetic telemetry (`tests/test_reconciliation.py`, ratio close
+to 1.0) and comfortably fails the fabricated single-STATE-event case
+(`tests/test_rereview_fixes.py`, ratio 0.0).
 
 ## Tests
 
@@ -215,9 +275,55 @@ the report and marks each incomplete cell "incomplete" instead of a number.
   (verbatim, parsed from this file) against a real broker from a clean
   subprocess, to catch the class of bug where the README and the code
   drift apart.
+- `tests/test_broker_ownership.py` - `start_broker`/`stop_broker` refuse to
+  touch a same-name container they don't own, and clean up only their own
+  same-run leftover.
+- `tests/test_rereview_fixes.py` - the five items from Astra's rereview
+  (write-failure dedup-state rollback and retriable replay, seq_conflict
+  vs duplicate classification including across a restart, the STATE+COUNT
+  completeness coverage rule, alarm ts-regression rejection with a
+  well-ordered-pair regression check, and start_broker refusing a
+  same-name container from a different run).
 
-Run everything: `python3 -m pytest -v` (takes roughly 2-3 minutes; the full
+Run everything: `python3 -m pytest -v` (takes roughly 5-6 minutes; the full
 synthetic day is ~9,400 MQTT messages).
+
+## Container ownership and run isolation
+
+`src/broker.py` labels every container it creates with two labels: a
+project-ownership label (`com.plant-oee-demo.owner`) and a per-run id
+label (`com.plant-oee-demo.run-id`, one fresh UUID generated per Python
+process/import - `broker.RUN_ID`). `start_broker()`'s handling of a
+same-name collision:
+
+- **Not project-labelled** (belongs to something else on the host): left
+  untouched, `RuntimeError` raised. Unchanged from before.
+- **Project-labelled, same run-id** (this exact process called
+  `start_broker()` again without stopping first - e.g. crash recovery
+  within one run): treated as this run's own stale leftover and replaced.
+- **Project-labelled, different run-id** (a different, possibly still
+  active, run of this same demo happened to use the same name): **refused**
+  with a `RuntimeError`, never force-removed. This is the fix for the
+  narrowed finding: a fixed default name previously let a second run's
+  `start_broker()` silently kill a first run's still-active container.
+
+**Narrowed claim, not "never touches any other container of this demo
+under any circumstances"**: two runs that both explicitly pass the *same*
+non-default `name` are still, by design, refused from colliding (the
+run-id check above) - they will never race to remove each other, but the
+second one to start will fail loudly rather than get its own broker. True
+concurrency isolation requires distinct names, which is why
+`broker.unique_name()` (a name suffixed with a fresh UUID) exists and is
+what `tests/conftest.py`'s `mqtt_broker` fixture always uses - every test
+run gets its own name and never depends on the collision-handling logic
+above at all. The CLI (`python3 src/broker.py` / `... stop`) still uses the
+fixed default `CONTAINER_NAME` across its two separate invocations by
+design (so the `stop` subcommand, run as a second process with no state
+passed to it, can find what `start_broker()` created) - this is a
+single-instance-at-a-time contract for manual CLI use, not a claim that
+concurrent manual CLI runs are supported. Verified in
+`tests/test_broker_ownership.py` (unowned and same-run-leftover cases) and
+`tests/test_rereview_fixes.py::test_start_broker_refuses_a_same_name_container_from_a_different_run`.
 
 ## Self-check performed before delivery
 
@@ -228,11 +334,13 @@ synthetic day is ~9,400 MQTT messages).
 - Grepped for owner/host/employer/industry/site strings - none present;
   the line, machines, tags and reason codes are all invented for this demo.
 - Podman: this repo's own container(s) are labelled with an ownership tag
-  and only a container carrying that label is ever force-removed; a
-  same-name container without it is left untouched and `start_broker()`
-  raises instead. `podman ps -a` is checked before and after - no leftover
-  containers from this repo, and no other container on the host is
-  touched.
+  and a per-run id tag (see "Container ownership and run isolation"
+  below); only a container carrying both this project's ownership label
+  AND this exact run's id is ever force-removed as a "stale leftover" -
+  same-name, different-owner is refused, and same-name/same-owner but a
+  *different* run's id is also refused (not silently killed). `podman ps
+  -a` is checked before and after - no leftover containers from this repo,
+  and no other container on the host is touched.
 
 ## What this demo does not claim
 
@@ -249,3 +357,10 @@ synthetic day is ~9,400 MQTT messages).
 - The ground-truth oracle is schedule-based and shares its tick-generation
   helper with the event stream it's checked against - it is not a fully
   independent reimplementation (see "What's in the box" above).
+- No concurrent-manual-CLI-runs support: `python3 src/broker.py` /
+  `... stop` use a fixed default container name across their two separate
+  invocations by design; two concurrent runs that both rely on that
+  default will correctly refuse to collide (see "Container ownership and
+  run isolation" above) rather than race, but only one of them gets a
+  broker. Use `broker.unique_name()` (as the test suite does) for genuine
+  concurrent isolation.

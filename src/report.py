@@ -9,15 +9,28 @@ of the report's queries run against one DuckDB connection opened read-only,
 so nothing else can be writing through that connection while the report is
 built.
 
-Completeness: a machine/shift's STATE telemetry is expected to fully tile
-the shift window (see schedule.py) - RUN+DOWN+IDLE seconds should sum to
-exactly the planned production time. If it doesn't (missing/partial STATE
-events - e.g. a machine that never reported, or an empty database), that
-machine/shift is marked incomplete (`complete: False`) and its
-availability/performance/quality/OEE are withheld (`None`) rather than
-computed and reported as an ordinary (mathematically valid but misleading)
-zero. `data["completeness"]["all_complete"]` is the whole-report rollup;
-render_html() renders incomplete cells distinctly and banners the report.
+Completeness (coverage rule - both legs required, not STATE alone):
+  1. STATE coverage: a machine/shift's STATE telemetry is expected to fully
+     tile the shift window (see schedule.py) - RUN+DOWN+IDLE seconds should
+     sum to exactly the planned production time.
+  2. COUNT coverage: whenever that tiling reports run_seconds > 0, actual
+     COUNT telemetry (good_delta+reject_delta summed within the window)
+     must reach at least MIN_COUNT_COVERAGE_FRACTION of the production
+     ticks that run time implies at the machine's ideal cycle time
+     (run_seconds / ideal_cycle_seconds). A single STATE event whose
+     segment is extrapolated all the way to the shift end by
+     `_state_seconds`'s lead()/COALESCE (e.g. one RUN report and nothing
+     else) satisfies leg 1 on its own - it produces a numerically "full"
+     covered duration without a single corroborating COUNT tick - so leg 2
+     exists specifically to catch that case: RUN time claimed but not
+     backed by any production evidence. run_seconds == 0 requires no COUNT
+     evidence (nothing was claimed to run).
+A machine/shift failing either leg is marked incomplete (`complete: False`)
+and its availability/performance/quality/OEE are withheld (`None`) rather
+than computed and reported as an ordinary (mathematically valid but
+misleading) zero. `data["completeness"]["all_complete"]` is the
+whole-report rollup; render_html() renders incomplete cells distinctly and
+banners the report. See also README.md's "Completeness" section.
 
 Atomic publish (per file, not per report-set): report.html and report.json
 are each written to a temp file in the destination directory and moved into
@@ -60,6 +73,16 @@ OEE_METHOD_NOTE = (
 
 COMPLETENESS_TOLERANCE_SECONDS = 1e-6
 
+# The floor is deliberately generous (0.5, not ~1.0): this is a coarse
+# corroboration check ("did any real production evidence show up for the
+# run time claimed"), not a re-derivation of performance - performance
+# itself is computed from the actual counts once a machine/shift is
+# complete. It is comfortably below the near-1.0 ratio real dense synthetic
+# telemetry produces (tests/test_reconciliation.py) and comfortably above
+# the 0.0 a single extrapolated STATE event with no counts produces
+# (tests/test_durability.py).
+MIN_COUNT_COVERAGE_FRACTION = 0.5
+
 FORMULAS = {
     "availability": "Run Time / Planned Production Time (DOWN and IDLE both count as downtime)",
     "performance": "(Good Count + Reject Count) * Ideal Cycle Time / Run Time",
@@ -94,15 +117,34 @@ def build_report_data(db_path: str) -> dict:
                 down_s = _state_seconds(con, machine, shift_name, s_start, s_end, "DOWN")
                 idle_s = _state_seconds(con, machine, shift_name, s_start, s_end, "IDLE")
                 covered = run_s + down_s + idle_s
-                complete = abs(covered - planned) < COMPLETENESS_TOLERANCE_SECONDS
+                state_complete = abs(covered - planned) < COMPLETENESS_TOLERANCE_SECONDS
+
+                g, r = _counts(con, machine, s_start, s_end)
+                total = g + r
+                expected_ticks = (run_s / IDEAL_CYCLE_S[machine]) if run_s > 0 else 0.0
+                count_complete = expected_ticks == 0.0 or total >= expected_ticks * MIN_COUNT_COVERAGE_FRACTION
+
+                complete = state_complete and count_complete
                 completeness_reason = None
                 if not complete:
-                    completeness_reason = (
-                        f"STATE telemetry covers {covered:.1f}s of {planned:.1f}s planned "
-                        f"production time for {machine}/{shift_name} "
-                        f"(gap {planned - covered:.1f}s) - machine reported no/partial "
-                        "state telemetry for this window."
-                    )
+                    reasons = []
+                    if not state_complete:
+                        reasons.append(
+                            f"STATE telemetry covers {covered:.1f}s of {planned:.1f}s planned "
+                            f"production time for {machine}/{shift_name} "
+                            f"(gap {planned - covered:.1f}s) - machine reported no/partial "
+                            "state telemetry for this window."
+                        )
+                    if not count_complete:
+                        reasons.append(
+                            f"COUNT telemetry shows {total} counted unit(s) for {machine}/{shift_name} "
+                            f"against ~{expected_ticks:.0f} expected from {run_s:.1f}s of reported RUN "
+                            f"time at this machine's ideal cycle time - below the "
+                            f"{MIN_COUNT_COVERAGE_FRACTION*100:.0f}% coverage floor (see README's "
+                            "Completeness section) - RUN state is reported but not corroborated by "
+                            "count telemetry."
+                        )
+                    completeness_reason = " ".join(reasons)
                     incomplete.append({
                         "machine": machine,
                         "shift": shift_name,
@@ -110,8 +152,6 @@ def build_report_data(db_path: str) -> dict:
                         "coverage_seconds": covered,
                         "gap_seconds": planned - covered,
                     })
-                g, r = _counts(con, machine, s_start, s_end)
-                total = g + r
                 pareto = _downtime_pareto(con, machine, s_start, s_end)
                 if complete:
                     availability = run_s / planned if planned else 0.0
@@ -233,11 +273,16 @@ def _downtime_pareto(con, machine, s_start, s_end) -> dict:
 
 
 def _alarm_summary(con) -> list[dict]:
-    # Safe by construction: the ingester (ingester.py) enforces strictly
-    # alternating RAISE/CLEAR phases per (machine, alarm_code) and rejects
-    # (alarm_out_of_order_rejected) anything else before it reaches
-    # alarm_events, so "the next event for this (machine, code)" is always
-    # that RAISE's actual CLEAR, never a fabricated one.
+    # Pairs each RAISE with "the next event for this (machine, code)" by
+    # event ts (ORDER BY ts below), which is safe by construction: the
+    # ingester (ingester.py) enforces, per (machine, alarm_code), both
+    # strictly alternating RAISE/CLEAR phases AND non-decreasing event ts
+    # (alarm_out_of_order_rejected covers a phase repeat and a ts
+    # regression alike). A ts-sorted alternating, ts-monotonic sequence is
+    # already in RAISE/CLEAR pairing order, so this is pairing by
+    # timestamp identity, not receipt order - "the next event by ts" is
+    # always that RAISE's actual CLEAR, never a fabricated one from a
+    # different arrival order.
     rows = con.execute(
         """
         WITH paired AS (
@@ -254,12 +299,22 @@ def _alarm_summary(con) -> list[dict]:
     summary: dict[tuple, dict] = {}
     for machine, code, raised, cleared in rows:
         key = (machine, code)
-        d = summary.setdefault(key, {"count": 0, "duration_seconds": 0.0})
+        d = summary.setdefault(key, {"count": 0, "duration_seconds": 0.0, "open_count": 0})
         d["count"] += 1
         if cleared is not None:
             d["duration_seconds"] += (cleared - raised).total_seconds()
+        else:
+            # A RAISE with no following CLEAR yet (either genuinely still
+            # open, or its CLEAR was rejected - see ingester.py). Counted
+            # explicitly rather than silently folded into an
+            # indistinguishable "0 extra seconds" of duration.
+            d["open_count"] += 1
     return [
-        {"machine": m, "alarm_code": c, "count": v["count"], "duration_seconds": v["duration_seconds"]}
+        {
+            "machine": m, "alarm_code": c,
+            "count": v["count"], "duration_seconds": v["duration_seconds"],
+            "open_count": v["open_count"],
+        }
         for (m, c), v in sorted(summary.items())
     ]
 
@@ -291,7 +346,8 @@ def render_html(data: dict) -> str:
                 )
     alarm_rows = [
         f"<tr><td>{_esc(a['machine'])}</td><td>{_esc(a['alarm_code'])}</td>"
-        f"<td>{_esc(a['count'])}</td><td>{a['duration_seconds']:.0f}s</td></tr>"
+        f"<td>{_esc(a['count'])}</td><td>{a['duration_seconds']:.0f}s</td>"
+        f"<td>{_esc(a['open_count'])}</td></tr>"
         for a in data["alarms"]
     ]
     ingest_rows = [
@@ -343,7 +399,7 @@ h1, h2 {{ margin-top: 2rem; }}
 </table>
 
 <h2>Alarm summary</h2>
-<table><tr><th>Machine</th><th>Alarm code</th><th>Count</th><th>Total duration</th></tr>
+<table><tr><th>Machine</th><th>Alarm code</th><th>Count</th><th>Total duration</th><th>Open (unpaired)</th></tr>
 {''.join(alarm_rows)}
 </table>
 

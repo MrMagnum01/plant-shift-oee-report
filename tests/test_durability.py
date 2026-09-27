@@ -218,16 +218,32 @@ def test_empty_db_marks_every_machine_shift_incomplete(tmp_path):
 
 
 def test_full_shift_coverage_is_marked_complete(tmp_path):
-    # A machine/shift with full STATE coverage must NOT be marked
-    # incomplete (no false positives from the completeness check).
+    # A machine/shift with full STATE coverage AND count telemetry
+    # corroborating the claimed run time must NOT be marked incomplete (no
+    # false positives from the completeness check - see report.py's
+    # coverage rule and item 3 below for the false-positive-the-other-way
+    # case this is paired with).
+    from schedule import IDEAL_CYCLE_S
+
     db_path = str(tmp_path / "full_shift.duckdb")
     con = duckdb.connect(db_path)
     ing = Ingester(con)
     t0 = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    seq = 1
     ing.handle_raw(json.dumps(dict(
-        seq=1, tag="LINE_A.FILLER", type="STATE", state="RUN",
+        seq=seq, tag="LINE_A.FILLER", type="STATE", state="RUN",
         reason_code=None, ts=t0.isoformat(),
     )))
+    seq += 1
+    cycle = IDEAL_CYCLE_S["LINE_A.FILLER"]
+    tick = t0
+    for _ in range(960):  # 8h / 30s ideal cycle - full corroborating coverage
+        tick = tick + timedelta(seconds=cycle)
+        ing.handle_raw(json.dumps(dict(
+            seq=seq, tag="LINE_A.FILLER", type="COUNT",
+            good_delta=1, reject_delta=0, ts=tick.isoformat(),
+        )))
+        seq += 1
     ing.commit()
     con.close()
     data = build_report_data(db_path)

@@ -11,7 +11,9 @@ CREATE TABLE IF NOT EXISTS ingest_log (
     seq           BIGINT,
     ts_raw        TEXT,
     raw_payload   TEXT NOT NULL,
-    reason        TEXT
+    reason        TEXT,
+    content_hash  TEXT  -- sha256 of the canonicalised message - identity for
+                          -- duplicate vs seq_conflict classification
 );
 
 CREATE TABLE IF NOT EXISTS state_events (
