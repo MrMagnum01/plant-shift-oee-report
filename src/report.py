@@ -145,9 +145,20 @@ def build_report_data(db_path: str) -> dict:
                 total = g + r
 
                 complete, cov = _coverage(observations, s_start, s_end, COVERAGE_GAP_SECONDS)
+                # Liveness (HEARTBEAT) proves the machine was reporting, not what state it was in.
+                # State evidence is required too: a STATE event at or before the window start
+                # (within the coverage gap) or inside the window, and some STATE time in the window.
+                state_known = _state_evidence(con, machine, s_start, s_end, COVERAGE_GAP_SECONDS) and (run_s + down_s + idle_s) > 0
+                cov["state_ok"] = state_known
+                complete = complete and state_known
                 completeness_reason = None
                 if not complete:
                     reasons = []
+                    if not state_known:
+                        reasons.append(
+                            f"no STATE evidence for {machine} in the {shift_name} window - heartbeats "
+                            "prove reporting, not machine state, so availability cannot be computed."
+                        )
                     if not cov["start_ok"]:
                         reasons.append(
                             f"no observed telemetry (STATE/COUNT/ALARM/HEARTBEAT) within "
@@ -254,6 +265,16 @@ def _observed_timestamps(con, machine) -> list:
     return [r[0] for r in rows]
 
 
+def _state_evidence(con, machine, s_start, s_end, gap_s: float) -> bool:
+    """True when a STATE event lies inside [s_start, s_end], or the last STATE event before
+    s_start is followed by uninterrupted evidence (the caller's gap check covers that)."""
+    row = con.execute(
+        "SELECT count(*) FROM state_events WHERE machine = ? AND ts <= ?",
+        [machine, s_end],
+    ).fetchone()
+    return bool(row and row[0] > 0)
+
+
 def _coverage(observations: list, s_start, s_end, gap_s: float) -> tuple[bool, dict]:
     """Observed-coverage check for one shift window (see module docstring):
     (a) an observation at or near s_start, (b) an observation within gap_s
@@ -278,9 +299,14 @@ def _coverage(observations: list, s_start, s_end, gap_s: float) -> tuple[bool, d
     )
 
     window_obs = [ts for ts in observations if s_start <= ts <= s_end]
+    # Gaps are measured across the whole evidence chain, including the boundary
+    # observations that satisfied (a) and (b): 07:59:59 and 16:00:01 alone must not
+    # pass as a gap-free 08:00-16:00 window.
+    chain = ([before_start[-1]] if before_start else []) + window_obs + ([after_end[0]] if after_end else [])
+    chain = sorted(set(chain))
     max_gap = 0.0
     max_gap_at = (s_start, s_start)
-    for a, b in zip(window_obs, window_obs[1:]):
+    for a, b in zip(chain, chain[1:]):
         d = (b - a).total_seconds()
         if d > max_gap:
             max_gap, max_gap_at = d, (a, b)
