@@ -218,11 +218,12 @@ def test_empty_db_marks_every_machine_shift_incomplete(tmp_path):
 
 
 def test_full_shift_coverage_is_marked_complete(tmp_path):
-    # A machine/shift with full STATE coverage AND count telemetry
-    # corroborating the claimed run time must NOT be marked incomplete (no
-    # false positives from the completeness check - see report.py's
-    # coverage rule and item 3 below for the false-positive-the-other-way
-    # case this is paired with).
+    # A machine/shift with a STATE observation at the window start and
+    # dense COUNT telemetry (30s cadence, comfortably under the coverage
+    # gap G) reaching all the way to the window end must NOT be marked
+    # incomplete (no false positives from the observed-coverage check -
+    # see report.py's _coverage() and tests/test_completeness_coverage.py
+    # for the false-positive-the-other-way cases this is paired with).
     from schedule import IDEAL_CYCLE_S
 
     db_path = str(tmp_path / "full_shift.duckdb")

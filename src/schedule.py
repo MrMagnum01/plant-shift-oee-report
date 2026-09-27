@@ -29,6 +29,19 @@ SHIFTS = [
 
 MACHINES = ["LINE_A.FILLER", "LINE_A.CAPPER", "LINE_A.LABELLER"]
 
+# Every machine also publishes a periodic HEARTBEAT (events.py) independent
+# of its state - it exists purely to prove "this machine was still
+# reporting" during long DOWN/IDLE stretches, where COUNT ticks stop
+# entirely and STATE only emits on a transition. 5 minutes is comfortably
+# below every DOWN/IDLE segment length in STATE_SEGMENTS (shortest is 10
+# minutes) so a genuinely reporting machine always has multiple heartbeats
+# inside any such segment, and comfortably below report.py's coverage gap
+# G (ingester.CLOCK_GAP_THRESHOLD_SECONDS, 600s / 10 minutes - the same
+# "how long is too long without hearing from a machine" threshold already
+# used for the ingester's own clock-gap monitoring signal) so losing a
+# single heartbeat still leaves coverage intact.
+HEARTBEAT_INTERVAL_S = 300.0
+
 # Ideal cycle time in seconds/unit for each machine (made-up nameplate figure).
 # Chosen coarse enough that a full synthetic day is a few thousand MQTT
 # messages, not hundreds of thousands - this is a demo, not a load test.

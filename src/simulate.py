@@ -3,10 +3,14 @@ Deterministic simulator: publishes the canonical event stream (events.py,
 derived from schedule.py) over MQTT as the plant's machines would.
 
 Payload grammar (all fields required unless noted):
-  {"seq": <int>, "ts": "<ISO8601, timezone-aware>", "tag": "<machine>", "type": "STATE|COUNT|ALARM", ...}
+  {"seq": <int>, "ts": "<ISO8601, timezone-aware>", "tag": "<machine>", "type": "STATE|COUNT|ALARM|HEARTBEAT", ...}
   STATE: state in {RUN,IDLE,DOWN}, reason_code (string if DOWN, else null)
   COUNT: good_delta (int>=0), reject_delta (int>=0)
   ALARM: alarm_code (non-empty string), phase in {RAISE,CLEAR}
+  HEARTBEAT: no extra fields - a periodic "still reporting" pulse per
+    machine (schedule.HEARTBEAT_INTERVAL_S), used by report.py to
+    establish telemetry coverage during DOWN/IDLE stretches with no COUNT
+    ticks.
 
 Topic: demo/plant/<tag>/<type-lowercased>
 """

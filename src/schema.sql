@@ -46,6 +46,14 @@ CREATE TABLE IF NOT EXISTS alarm_events (
     is_late     BOOLEAN NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS heartbeats (
+    log_id      BIGINT PRIMARY KEY,
+    machine     TEXT NOT NULL,
+    ts          TIMESTAMP NOT NULL,
+    seq         BIGINT NOT NULL,
+    is_late     BOOLEAN NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS clock_gaps (
     id            BIGINT PRIMARY KEY DEFAULT nextval('log_id_seq'),
     machine       TEXT NOT NULL,

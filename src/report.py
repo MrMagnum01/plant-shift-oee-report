@@ -9,28 +9,50 @@ of the report's queries run against one DuckDB connection opened read-only,
 so nothing else can be writing through that connection while the report is
 built.
 
-Completeness (coverage rule - both legs required, not STATE alone):
-  1. STATE coverage: a machine/shift's STATE telemetry is expected to fully
-     tile the shift window (see schedule.py) - RUN+DOWN+IDLE seconds should
-     sum to exactly the planned production time.
-  2. COUNT coverage: whenever that tiling reports run_seconds > 0, actual
-     COUNT telemetry (good_delta+reject_delta summed within the window)
-     must reach at least MIN_COUNT_COVERAGE_FRACTION of the production
-     ticks that run time implies at the machine's ideal cycle time
-     (run_seconds / ideal_cycle_seconds). A single STATE event whose
-     segment is extrapolated all the way to the shift end by
-     `_state_seconds`'s lead()/COALESCE (e.g. one RUN report and nothing
-     else) satisfies leg 1 on its own - it produces a numerically "full"
-     covered duration without a single corroborating COUNT tick - so leg 2
-     exists specifically to catch that case: RUN time claimed but not
-     backed by any production evidence. run_seconds == 0 requires no COUNT
-     evidence (nothing was claimed to run).
-A machine/shift failing either leg is marked incomplete (`complete: False`)
-and its availability/performance/quality/OEE are withheld (`None`) rather
-than computed and reported as an ordinary (mathematically valid but
-misleading) zero. `data["completeness"]["all_complete"]` is the
-whole-report rollup; render_html() renders incomplete cells distinctly and
-banners the report. See also README.md's "Completeness" section.
+Completeness (observed-coverage rule, NOT state tiling or count magnitude):
+  A machine/shift's telemetry "covers" the window only when there is actual
+  evidence a message could have arrived throughout it. This is judged from
+  the timestamps of every message this pipeline can receive for that
+  machine - STATE, COUNT, ALARM, and the periodic HEARTBEAT (events.py,
+  schedule.HEARTBEAT_INTERVAL_S) added specifically to keep evidence
+  flowing through DOWN/IDLE stretches where COUNT stops entirely and STATE
+  only fires on a transition. A window is complete only if ALL of:
+    (a) there is an observation at or near the window start (within G);
+    (b) there is an observation within G of the window end - a terminal
+        observation proving the machine was still reporting through the
+        close of the window, not just at some point inside it;
+    (c) no gap between two consecutive observations inside the window
+        exceeds G.
+  G is COVERAGE_GAP_SECONDS below - the same 600s/10-minute "how long is
+  too long without hearing from a machine" threshold already used for the
+  ingester's own clock-gap monitoring signal (ingester.CLOCK_GAP_THRESHOLD_
+  SECONDS), reused here rather than duplicated. See _coverage() for the
+  exact check and schedule.HEARTBEAT_INTERVAL_S for why 5-minute heartbeats
+  make G achievable for a genuinely-reporting machine.
+
+  This replaces two earlier, broken proxies for coverage, both now
+  deliberately excluded:
+    - STATE "tiling": `_state_seconds()` extrapolates a STATE event's
+      segment to the next STATE event, or to the shift's end if there is
+      no next one (lead()/COALESCE in the SQL) - so a single RUN report and
+      nothing else "tiles" the entire window on its own, with zero
+      corroborating evidence anything was heard from after that one
+      message. Still used below to size run/down/idle seconds for display,
+      but never to decide `complete`.
+    - COUNT magnitude/fraction thresholds: a large count total is evidence
+      of production, not of coverage - a machine can produce a lot in a
+      burst and then go silent, or produce genuinely little while staying
+      fully covered (a slow but fully-instrumented shift). Coverage is
+      about observed messages over time, never about how many units they
+      report.
+  A machine/shift failing the coverage rule is marked incomplete
+  (`complete: False`) and its availability/performance/quality/OEE are
+  withheld (`None`) rather than computed and reported as an ordinary
+  (mathematically valid but misleading) zero - low genuine production on a
+  fully-covered window is never treated as lost telemetry.
+  `data["completeness"]["all_complete"]` is the whole-report rollup;
+  render_html() renders incomplete cells distinctly and banners the report
+  with the specific reason. See also README.md's "Completeness" section.
 
 Atomic publish (per file, not per report-set): report.html and report.json
 are each written to a temp file in the destination directory and moved into
@@ -58,6 +80,7 @@ from pathlib import Path
 
 import duckdb
 
+from ingester import CLOCK_GAP_THRESHOLD_SECONDS
 from schedule import IDEAL_CYCLE_S, MACHINES, SHIFTS
 
 REPORT_ROLE_LINE = (
@@ -71,17 +94,13 @@ OEE_METHOD_NOTE = (
     "production line's performance. No benchmark or industry-comparison claim is made."
 )
 
-COMPLETENESS_TOLERANCE_SECONDS = 1e-6
-
-# The floor is deliberately generous (0.5, not ~1.0): this is a coarse
-# corroboration check ("did any real production evidence show up for the
-# run time claimed"), not a re-derivation of performance - performance
-# itself is computed from the actual counts once a machine/shift is
-# complete. It is comfortably below the near-1.0 ratio real dense synthetic
-# telemetry produces (tests/test_reconciliation.py) and comfortably above
-# the 0.0 a single extrapolated STATE event with no counts produces
-# (tests/test_durability.py).
-MIN_COUNT_COVERAGE_FRACTION = 0.5
+# G: the maximum gap (seconds) between observed messages for a machine that
+# still counts as "covered". Deliberately the same threshold the ingester
+# already uses for its own clock-gap monitoring signal (documented in
+# README.md's "Ingest validation policy" section) rather than a second,
+# independently-tunable number - one definition of "too long without
+# hearing from a machine", used both places.
+COVERAGE_GAP_SECONDS = CLOCK_GAP_THRESHOLD_SECONDS
 
 FORMULAS = {
     "availability": "Run Time / Planned Production Time (DOWN and IDLE both count as downtime)",
@@ -107,6 +126,11 @@ def build_report_data(db_path: str) -> dict:
         incomplete: list[dict] = []
         for machine in MACHINES:
             shifts_out = {}
+            # All of this machine's observed message timestamps (STATE,
+            # COUNT, ALARM, HEARTBEAT) across the whole day, fetched once
+            # and reused for every shift's coverage check below - coverage
+            # is about when messages arrived, not what any one of them said.
+            observations = _observed_timestamps(con, machine)
             for shift_name, s_start_tz, s_end_tz in SHIFTS:
                 # DuckDB TIMESTAMP is naive (UTC by construction throughout
                 # this pipeline); strip tzinfo so comparisons against rows
@@ -116,41 +140,45 @@ def build_report_data(db_path: str) -> dict:
                 run_s = _state_seconds(con, machine, shift_name, s_start, s_end, "RUN")
                 down_s = _state_seconds(con, machine, shift_name, s_start, s_end, "DOWN")
                 idle_s = _state_seconds(con, machine, shift_name, s_start, s_end, "IDLE")
-                covered = run_s + down_s + idle_s
-                state_complete = abs(covered - planned) < COMPLETENESS_TOLERANCE_SECONDS
 
                 g, r = _counts(con, machine, s_start, s_end)
                 total = g + r
-                expected_ticks = (run_s / IDEAL_CYCLE_S[machine]) if run_s > 0 else 0.0
-                count_complete = expected_ticks == 0.0 or total >= expected_ticks * MIN_COUNT_COVERAGE_FRACTION
 
-                complete = state_complete and count_complete
+                complete, cov = _coverage(observations, s_start, s_end, COVERAGE_GAP_SECONDS)
                 completeness_reason = None
                 if not complete:
                     reasons = []
-                    if not state_complete:
+                    if not cov["start_ok"]:
                         reasons.append(
-                            f"STATE telemetry covers {covered:.1f}s of {planned:.1f}s planned "
-                            f"production time for {machine}/{shift_name} "
-                            f"(gap {planned - covered:.1f}s) - machine reported no/partial "
-                            "state telemetry for this window."
+                            f"no observed telemetry (STATE/COUNT/ALARM/HEARTBEAT) within "
+                            f"{COVERAGE_GAP_SECONDS:.0f}s of the {shift_name} window start for "
+                            f"{machine} - coverage at the start of the window is unproven."
                         )
-                    if not count_complete:
+                    if not cov["end_ok"]:
                         reasons.append(
-                            f"COUNT telemetry shows {total} counted unit(s) for {machine}/{shift_name} "
-                            f"against ~{expected_ticks:.0f} expected from {run_s:.1f}s of reported RUN "
-                            f"time at this machine's ideal cycle time - below the "
-                            f"{MIN_COUNT_COVERAGE_FRACTION*100:.0f}% coverage floor (see README's "
-                            "Completeness section) - RUN state is reported but not corroborated by "
-                            "count telemetry."
+                            f"no observed telemetry within {COVERAGE_GAP_SECONDS:.0f}s of the "
+                            f"{shift_name} window end for {machine} - no terminal observation "
+                            "proves the machine was still reporting through the close of the "
+                            "window (a single early message extrapolated forward is not evidence)."
+                        )
+                    if not cov["gaps_ok"]:
+                        gap_a, gap_b = cov["max_internal_gap_at"]
+                        reasons.append(
+                            f"an inter-message gap of {cov['max_internal_gap_seconds']:.0f}s "
+                            f"(from {gap_a.isoformat()} to {gap_b.isoformat()}) inside the window "
+                            f"exceeds the {COVERAGE_GAP_SECONDS:.0f}s coverage gap - telemetry "
+                            "coverage is broken here, regardless of what state was last reported."
                         )
                     completeness_reason = " ".join(reasons)
                     incomplete.append({
                         "machine": machine,
                         "shift": shift_name,
                         "reason": completeness_reason,
-                        "coverage_seconds": covered,
-                        "gap_seconds": planned - covered,
+                        "start_ok": cov["start_ok"],
+                        "end_ok": cov["end_ok"],
+                        "gaps_ok": cov["gaps_ok"],
+                        "max_internal_gap_seconds": cov["max_internal_gap_seconds"],
+                        "observation_count": cov["n_observations"],
                     })
                 pareto = _downtime_pareto(con, machine, s_start, s_end)
                 if complete:
@@ -201,6 +229,71 @@ def build_report_data(db_path: str) -> dict:
             "all_complete": len(incomplete) == 0,
             "incomplete": incomplete,
         },
+    }
+
+
+def _observed_timestamps(con, machine) -> list:
+    """Every distinct timestamp at which this machine produced ANY message
+    - STATE, COUNT, ALARM or HEARTBEAT - sorted ascending. This is the raw
+    evidence _coverage() judges a shift window's completeness from; it
+    deliberately does not care what any of these messages said, only that
+    one arrived at that moment."""
+    rows = con.execute(
+        """
+        SELECT ts FROM state_events WHERE machine = ?
+        UNION
+        SELECT ts FROM count_ticks WHERE machine = ?
+        UNION
+        SELECT ts FROM alarm_events WHERE machine = ?
+        UNION
+        SELECT ts FROM heartbeats WHERE machine = ?
+        ORDER BY ts
+        """,
+        [machine, machine, machine, machine],
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+def _coverage(observations: list, s_start, s_end, gap_s: float) -> tuple[bool, dict]:
+    """Observed-coverage check for one shift window (see module docstring):
+    (a) an observation at or near s_start, (b) an observation within gap_s
+    of s_end, (c) no gap between consecutive observations inside the window
+    wider than gap_s. `observations` may include timestamps from outside
+    [s_start, s_end] (e.g. the previous/next shift's last/first message) -
+    that's deliberate: a message at 07:58 is legitimate "near the start"
+    evidence for an 08:00 shift start, not just messages strictly inside
+    the window count."""
+    before_start = [ts for ts in observations if ts <= s_start]
+    at_or_after_start = [ts for ts in observations if ts >= s_start]
+    start_ok = (
+        (bool(at_or_after_start) and (at_or_after_start[0] - s_start).total_seconds() <= gap_s)
+        or (bool(before_start) and (s_start - before_start[-1]).total_seconds() <= gap_s)
+    )
+
+    at_or_before_end = [ts for ts in observations if ts <= s_end]
+    after_end = [ts for ts in observations if ts >= s_end]
+    end_ok = (
+        (bool(at_or_before_end) and (s_end - at_or_before_end[-1]).total_seconds() <= gap_s)
+        or (bool(after_end) and (after_end[0] - s_end).total_seconds() <= gap_s)
+    )
+
+    window_obs = [ts for ts in observations if s_start <= ts <= s_end]
+    max_gap = 0.0
+    max_gap_at = (s_start, s_start)
+    for a, b in zip(window_obs, window_obs[1:]):
+        d = (b - a).total_seconds()
+        if d > max_gap:
+            max_gap, max_gap_at = d, (a, b)
+    gaps_ok = max_gap <= gap_s
+
+    ok = start_ok and end_ok and gaps_ok
+    return ok, {
+        "start_ok": start_ok,
+        "end_ok": end_ok,
+        "gaps_ok": gaps_ok,
+        "max_internal_gap_seconds": max_gap,
+        "max_internal_gap_at": max_gap_at,
+        "n_observations": len(window_obs),
     }
 
 
@@ -364,9 +457,13 @@ def render_html(data: dict) -> str:
         )
         completeness_banner = (
             '<p class="incomplete-banner"><b>INCOMPLETE DATA:</b> the following '
-            "machine/shift rows are missing STATE telemetry coverage; their "
+            "machine/shift rows lack proven observed-telemetry coverage (an "
+            "observation near the window start, one near the window end, and "
+            "no inter-message gap wider than the coverage threshold - see "
+            "README's \"Completeness\" section); their "
             "availability/performance/quality/OEE are withheld, not reported as "
-            f"zero:</p><ul>{items}</ul>"
+            f"zero. Coverage is judged from when messages arrived, never from "
+            f"how much they reported:</p><ul>{items}</ul>"
         )
 
     return f"""<!DOCTYPE html>

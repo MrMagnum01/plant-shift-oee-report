@@ -36,11 +36,13 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from events import tick_times
+from events import heartbeat_times, tick_times
 from schedule import (
     ALARMS,
+    BASE_DAY,
+    HEARTBEAT_INTERVAL_S,
     IDEAL_CYCLE_S,
     MACHINES,
     REJECT_EVERY_N,
@@ -168,6 +170,9 @@ def compute_ground_truth() -> dict:
         for machine, state, start, end, _ in STATE_SEGMENTS
         if state == "RUN"
     )
+    total_heartbeat_events = len(MACHINES) * len(
+        heartbeat_times(BASE_DAY, BASE_DAY + timedelta(hours=24), HEARTBEAT_INTERVAL_S)
+    )
 
     return {
         "machines": machines_out,
@@ -176,7 +181,8 @@ def compute_ground_truth() -> dict:
             "state_events": total_state_events,
             "count_events": total_count_events,
             "alarm_events": total_alarm_events,
-            "total": total_state_events + total_count_events + total_alarm_events,
+            "heartbeat_events": total_heartbeat_events,
+            "total": total_state_events + total_count_events + total_alarm_events + total_heartbeat_events,
         },
     }
 

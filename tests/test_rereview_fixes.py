@@ -182,8 +182,11 @@ def test_seq_conflict_survives_restart(tmp_path):
 
 
 # --------------------------------------------------------------------------
-# 3. Completeness must come from actual telemetry coverage, not
-#    STATE-only extrapolation.
+# 3. Completeness must come from observed telemetry coverage, not
+#    STATE-only extrapolation. (Superseded/tightened further by Astra's
+#    second recheck - see tests/test_completeness_coverage.py, which also
+#    covers DOWN/IDLE and count-magnitude false positives this original
+#    probe did not.)
 # --------------------------------------------------------------------------
 
 def test_one_state_no_counts_is_incomplete_with_oee_withheld(tmp_path):
@@ -207,7 +210,7 @@ def test_one_state_no_counts_is_incomplete_with_oee_withheld(tmp_path):
         assert s["complete"] is False
         assert s["oee"] is None
         assert s["availability"] is None
-        assert "COUNT telemetry" in s["completeness_reason"]
+        assert "observed telemetry" in s["completeness_reason"]
 
     assert data["completeness"]["all_complete"] is False
 

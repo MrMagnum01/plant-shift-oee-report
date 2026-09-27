@@ -78,9 +78,9 @@ def test_readme_quickstart_runs_from_clean_checkout(tmp_path):
         time.sleep(1.0)
         sim_proc = subprocess.run(simulate_cmd, cwd=ROOT, env=env, capture_output=True, text=True, timeout=120)
         assert sim_proc.returncode == 0, sim_proc.stderr
-        assert "published 9411 events" in sim_proc.stdout
+        assert "published 10275 events" in sim_proc.stdout
 
-        # Full synthetic day (~9.4k messages) over real MQTT, then a 15s
+        # Full synthetic day (~10.3k messages) over real MQTT, then a 15s
         # idle-timeout wait before the ingester exits - matches the
         # generous headroom tests/test_reconciliation.py already uses.
         try:

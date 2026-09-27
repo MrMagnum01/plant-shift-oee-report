@@ -89,7 +89,7 @@ import duckdb
 from schedule import MACHINES
 
 KNOWN_MACHINES = set(MACHINES)
-KNOWN_TYPES = {"STATE", "COUNT", "ALARM"}
+KNOWN_TYPES = {"STATE", "COUNT", "ALARM", "HEARTBEAT"}
 STATE_VALUES = {"RUN", "IDLE", "DOWN"}
 ALARM_PHASES = {"RAISE", "CLEAR"}
 
@@ -269,6 +269,7 @@ class Ingester:
                 SELECT machine, ts FROM state_events
                 UNION ALL SELECT machine, ts FROM count_ticks
                 UNION ALL SELECT machine, ts FROM alarm_events
+                UNION ALL SELECT machine, ts FROM heartbeats
             ) GROUP BY machine
             """
         ).fetchall()
@@ -498,6 +499,11 @@ class Ingester:
                     [log_id, tag, ts, msg["alarm_code"], msg["phase"], seq, is_late],
                 )
                 self.alarm_state[(tag, msg["alarm_code"])] = (msg["phase"], ts)
+            elif msg_type == "HEARTBEAT":
+                self.con.execute(
+                    "INSERT INTO heartbeats (log_id, machine, ts, seq, is_late) VALUES (?,?,?,?,?)",
+                    [log_id, tag, ts, seq, is_late],
+                )
             self._record(category)
             return category
         except Exception:

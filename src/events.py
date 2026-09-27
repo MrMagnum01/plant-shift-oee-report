@@ -12,7 +12,10 @@ from typing import Iterator
 
 from schedule import (
     ALARMS,
+    BASE_DAY,
+    HEARTBEAT_INTERVAL_S,
     IDEAL_CYCLE_S,
+    MACHINES,
     REJECT_EVERY_N,
     STATE_SEGMENTS,
 )
@@ -30,6 +33,17 @@ def tick_times(start: datetime, end: datetime, cycle_s: float) -> list[datetime]
     if n * cycle_s >= duration:
         n -= 1
     return [start + timedelta(seconds=cycle_s * (k + 1)) for k in range(n)]
+
+
+def heartbeat_times(start: datetime, end: datetime, interval_s: float) -> list[datetime]:
+    """Deterministic periodic heartbeat timestamps inside the half-open
+    interval [start, end): one every interval_s seconds, starting AT start
+    itself (unlike tick_times, which starts one interval after start) - a
+    heartbeat's whole job is to prove coverage at a window boundary, so it
+    must land exactly on t=start, not skip it."""
+    duration = (end - start).total_seconds()
+    n = int(duration // interval_s)
+    return [start + timedelta(seconds=interval_s * k) for k in range(n)]
 
 
 def raw_events() -> list[dict]:
@@ -66,6 +80,14 @@ def raw_events() -> list[dict]:
                     "reject_delta": 1 if is_reject else 0,
                 }
             )
+
+    # Periodic per-machine HEARTBEATs (schedule.HEARTBEAT_INTERVAL_S),
+    # independent of state - the coverage evidence report.py needs during
+    # DOWN/IDLE stretches, where no COUNT ticks are published at all. See
+    # schedule.py's comment on HEARTBEAT_INTERVAL_S for the cadence choice.
+    for machine in MACHINES:
+        for ts in heartbeat_times(BASE_DAY, BASE_DAY + timedelta(hours=24), HEARTBEAT_INTERVAL_S):
+            events.append({"ts": ts, "tag": machine, "type": "HEARTBEAT"})
 
     for machine, alarm_code, raised, cleared in ALARMS:
         events.append(

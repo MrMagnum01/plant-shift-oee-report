@@ -19,7 +19,7 @@ resemble them - that provenance cannot be certified.
   three 8h shifts, on a made-up synthetic date (2024-01-01).
 - **`src/events.py`** - turns the schedule into a single, globally
   sequence-numbered MQTT event stream (state changes, production ticks,
-  alarms).
+  alarms, and a periodic per-machine heartbeat - see "Completeness" below).
 - **`src/simulate.py`** - publishes that event stream over MQTT.
 - **`src/ingester.py`** - subscribes, validates strictly, and writes to
   DuckDB. See "Ingest validation policy" below.
@@ -49,7 +49,7 @@ python3 src/broker.py            # prints "broker up on 127.0.0.1:<port>"
 # in one terminal: ingest (creates the out/ directory if it doesn't exist)
 python3 src/ingester.py --host 127.0.0.1 --port <port> --db out/plant.duckdb --idle-timeout 15
 
-# in another: simulate a full synthetic day (3 shifts, ~9.4k messages)
+# in another: simulate a full synthetic day (3 shifts, ~10.3k messages)
 python3 src/simulate.py --port <port>
 
 # generate the report
@@ -104,6 +104,12 @@ quarantined messages keep their raw payload so they can be inspected later.
 | `alarm_out_of_order_rejected` | ALARM message whose phase doesn't follow the last accepted phase for that (machine, alarm_code), OR whose ts precedes the last accepted event's ts for that pair - e.g. two RAISEs in a row, a CLEAR with no open RAISE, or a CLEAR timestamped before its RAISE | no, quarantined with raw payload |
 | `unknown_tag` | `tag` is not one of the three known machines | no, quarantined |
 | `bad_payload` | Invalid JSON, missing/mistyped field, an invalid enum value (state/phase/etc.), or a scalar field (seq/state/phase/good_delta/...) that is the wrong JSON type (list/object) or out of range | no, quarantined |
+
+`type` is one of `STATE`, `COUNT`, `ALARM`, `HEARTBEAT` - all four go
+through the same categories and validation above. `HEARTBEAT` carries no
+fields beyond `seq`/`ts`/`tag`/`type`; it exists only to prove the machine
+was still reporting for `report.py`'s completeness check (see
+"Completeness" below), not to convey any state.
 
 **Duplicate vs seq_conflict**: durable event identity is bound to
 `(seq, content)`, not `seq` alone. Every accepted/accepted_late/rejected
@@ -219,42 +225,67 @@ concurrently-writing ingester.
 ## Completeness
 
 Each machine/shift's `availability`/`performance`/`quality`/`oee` are only
-computed when **both** legs of the coverage rule below hold - STATE tiling
-alone is not enough:
+computed when the machine's telemetry is proven to have **covered** the
+shift window - never inferred from state tiling, and never inferred from
+how much a machine reported.
 
-1. **STATE coverage**: STATE telemetry fully covers the shift window (RUN +
-   DOWN + IDLE seconds equal the planned production time, within a small
-   tolerance).
-2. **COUNT coverage**: whenever that tiling reports `run_seconds > 0`,
-   actual COUNT telemetry (`good_delta + reject_delta`, summed within the
-   window) must reach at least 50% (`MIN_COUNT_COVERAGE_FRACTION` in
-   `report.py`) of the production ticks that run time implies at the
-   machine's ideal cycle time (`run_seconds / ideal_cycle_seconds`). If
-   `run_seconds == 0`, no COUNT evidence is required.
+Every machine publishes four message types: `STATE`, `COUNT`, `ALARM`, and
+a periodic `HEARTBEAT` (`schedule.HEARTBEAT_INTERVAL_S`, 5 minutes) that
+carries no payload beyond identifying the machine - its only job is to
+prove the machine was still reporting during DOWN/IDLE stretches, where
+`COUNT` stops entirely and `STATE` only fires on a transition. Coverage for
+a shift window is the timestamps of these messages, nothing else. A window
+is complete only if **all** of:
 
-Leg 2 exists specifically because leg 1 alone can be satisfied by
-extrapolation: `_state_seconds()` extends a STATE event's segment to the
-next STATE event, or to the shift's end if there isn't one
-(`lead()`/`COALESCE` in the SQL) - so a single RUN report and nothing else
-tiles the *entire* window on its own, reporting a numerically "full"
-`run_seconds` with zero corroborating production evidence. Leg 2 catches
-that: RUN time claimed but not backed by any counts.
+1. **Start coverage**: there is an observation at or near the window start.
+2. **End coverage**: there is an observation within **G** of the window
+   end - a *terminal* observation proving the machine was still reporting
+   through the close of the window, not just at some point inside it.
+3. **No internal gap**: no gap between two consecutive observations inside
+   the window exceeds **G**.
 
-If either leg fails - e.g. an empty database, a machine that never
-reported, or a machine reporting RUN with no counts - the derived fields
-are withheld (`null` in the JSON) rather than computed from a hole (or an
-unproven claim) in the timeline and reported as an ordinary-looking zero.
-`data["completeness"]` gives the whole-report rollup (`all_complete` plus a
-list of the specific incomplete machine/shift rows with a reason that names
-which leg failed), and the rendered HTML banners the report and marks each
-incomplete cell "incomplete" instead of a number.
+**G = 600 seconds (10 minutes)** - `report.COVERAGE_GAP_SECONDS`, which is
+literally the same constant as the ingester's own clock-gap monitoring
+threshold (`ingester.CLOCK_GAP_THRESHOLD_SECONDS`, see "Ingest validation
+policy" above), reused rather than duplicated: one definition of "too long
+without hearing from a machine". The 5-minute heartbeat cadence is
+comfortably below G (a single missed heartbeat still leaves a gap under G)
+and comfortably below every DOWN/IDLE segment length in the schedule
+(shortest is 10 minutes), so a genuinely-reporting machine always clears
+all three checks.
 
-This is a coarse corroboration check, not a re-derivation of performance -
-performance itself is computed from the actual counts once a machine/shift
-is complete. The 50% floor is deliberately generous: it comfortably passes
-real dense synthetic telemetry (`tests/test_reconciliation.py`, ratio close
-to 1.0) and comfortably fails the fabricated single-STATE-event case
-(`tests/test_rereview_fixes.py`, ratio 0.0).
+This deliberately replaces two earlier, broken proxies for coverage that
+this demo shipped with and Astra's review caught:
+
+- **STATE "tiling" alone**: `_state_seconds()` extends a STATE event's
+  segment to the next STATE event, or to the shift's end if there is no
+  next one (`lead()`/`COALESCE` in the SQL) - so a single STATE report
+  (RUN, DOWN, *or* IDLE) and nothing else "tiles" the entire window on its
+  own, reporting a numerically "full" duration with zero evidence anything
+  was heard from after that one message. `run_seconds`/`down_seconds`/
+  `idle_seconds` are still computed this way for display, but this number
+  is no longer used to decide `complete` - only observed messages are.
+- **COUNT magnitude/fraction thresholds**: an earlier version required
+  counted units to reach some fraction of an ideal-cycle estimate. That
+  measures production, not coverage, and cuts both ways: a burst of counts
+  followed by silence would have passed it, and a fully-covered but
+  genuinely slow/low-output shift would have failed it. Neither is a
+  telemetry-coverage claim. Count magnitude establishes nothing about
+  coverage now, in either direction - low genuine production on a
+  fully-observed window is reported as low production, not withheld as
+  "incomplete".
+
+If coverage fails - e.g. an empty database, a machine that never reported,
+or a single STATE/COUNT message with no later telemetry proving the window
+was covered through to its end - the derived fields are withheld (`null`
+in the JSON) rather than computed from an unproven claim and reported as an
+ordinary-looking zero. `data["completeness"]` gives the whole-report
+rollup (`all_complete` plus a list of the specific incomplete machine/shift
+rows, each with `start_ok`/`end_ok`/`gaps_ok`, `max_internal_gap_seconds`,
+`observation_count`, and a reason naming exactly which check(s) failed),
+and the rendered HTML banners the report and marks each incomplete cell
+"incomplete" instead of a number. See `report.py`'s module docstring and
+`_coverage()` for the exact check.
 
 ## Tests
 
@@ -280,13 +311,22 @@ to 1.0) and comfortably fails the fabricated single-STATE-event case
   same-run leftover.
 - `tests/test_rereview_fixes.py` - the five items from Astra's rereview
   (write-failure dedup-state rollback and retriable replay, seq_conflict
-  vs duplicate classification including across a restart, the STATE+COUNT
-  completeness coverage rule, alarm ts-regression rejection with a
+  vs duplicate classification including across a restart, one STATE
+  message with no later telemetry staying incomplete under the
+  observed-coverage rule, alarm ts-regression rejection with a
   well-ordered-pair regression check, and start_broker refusing a
   same-name container from a different run).
+- `tests/test_completeness_coverage.py` - the observed-coverage completeness
+  rule from Astra's second recheck (state tiling and count magnitude are
+  not coverage): a single RUN/DOWN/IDLE state with no later telemetry stays
+  incomplete on every shift; an inflated COUNT delta with no terminal
+  observation does not establish coverage; the fully-observed synthetic
+  fixture (with heartbeats) stays complete with its exact measured
+  reconciliation; and a gap inside a window wider than G breaks coverage
+  even with earlier and later messages present.
 
 Run everything: `python3 -m pytest -v` (takes roughly 5-6 minutes; the full
-synthetic day is ~9,400 MQTT messages).
+synthetic day is ~10,275 MQTT messages, including periodic per-machine heartbeats).
 
 ## Container ownership and run isolation
 
