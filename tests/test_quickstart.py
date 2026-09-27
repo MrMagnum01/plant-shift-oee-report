@@ -29,7 +29,10 @@ def _quickstart_commands() -> list[str]:
 
 
 def _clean_env() -> dict:
-    return {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    # The README activates the venv first, so `python3` must resolve to the interpreter running the tests.
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
+    return env
 
 
 def test_readme_quickstart_has_expected_commands():
