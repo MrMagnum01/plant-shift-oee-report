@@ -245,10 +245,11 @@ is complete only if **all** of:
    **G** across the whole evidence chain: the boundary observations that
    satisfied (1) and (2) plus everything inside the window. Two messages just
    outside the window are therefore not coverage.
-4. **State evidence**: a `STATE` event exists for the machine at or before the
-   window, and the window has some STATE time. Heartbeats prove the machine
-   was reporting, not what state it was in, so heartbeats alone are
-   incomplete.
+4. **State evidence**: a `STATE` event exists at or before the window
+   start (the state is carried into the window) and the STATE segments cover
+   the whole window. A first STATE midway leaves an unknown-state prefix, and
+   the whole window's OEE is withheld. Heartbeats prove the machine was
+   reporting, not what state it was in.
 
 **G = 600 seconds (10 minutes)** - `report.COVERAGE_GAP_SECONDS`, which is
 literally the same constant as the ingester's own clock-gap monitoring

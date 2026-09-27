@@ -148,7 +148,10 @@ def build_report_data(db_path: str) -> dict:
                 # Liveness (HEARTBEAT) proves the machine was reporting, not what state it was in.
                 # State evidence is required too: a STATE event at or before the window start
                 # (within the coverage gap) or inside the window, and some STATE time in the window.
-                state_known = _state_evidence(con, machine, s_start, s_end, COVERAGE_GAP_SECONDS) and (run_s + down_s + idle_s) > 0
+                # A known state must be carried into the window from at or before its start, and the
+                # STATE segments must tile the whole window: an unknown prefix withholds the window.
+                state_known = (_state_evidence(con, machine, s_start, s_end, COVERAGE_GAP_SECONDS)
+                               and abs((run_s + down_s + idle_s) - planned) < 1.0)
                 cov["state_ok"] = state_known
                 complete = complete and state_known
                 completeness_reason = None
@@ -156,8 +159,9 @@ def build_report_data(db_path: str) -> dict:
                     reasons = []
                     if not state_known:
                         reasons.append(
-                            f"no STATE evidence for {machine} in the {shift_name} window - heartbeats "
-                            "prove reporting, not machine state, so availability cannot be computed."
+                            f"unknown machine state for {machine} in part of the {shift_name} window - no STATE "
+                            "event at or before the window start, or STATE segments do not cover the whole "
+                            "window; heartbeats prove reporting, not machine state."
                         )
                     if not cov["start_ok"]:
                         reasons.append(
@@ -266,11 +270,12 @@ def _observed_timestamps(con, machine) -> list:
 
 
 def _state_evidence(con, machine, s_start, s_end, gap_s: float) -> bool:
-    """True when a STATE event lies inside [s_start, s_end], or the last STATE event before
-    s_start is followed by uninterrupted evidence (the caller's gap check covers that)."""
+    """True when a STATE event exists at or before s_start, i.e. the machine's state is known
+    from the first second of the window (carried state). A first STATE midway leaves an
+    unknown prefix and returns False."""
     row = con.execute(
         "SELECT count(*) FROM state_events WHERE machine = ? AND ts <= ?",
-        [machine, s_end],
+        [machine, s_start],
     ).fetchone()
     return bool(row and row[0] > 0)
 
