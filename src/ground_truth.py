@@ -3,6 +3,17 @@ Planted ground truth, computed directly from schedule.py - independently of
 the MQTT stream, the ingester and DuckDB. This is the oracle that
 tests/test_reconciliation.py checks the generated report against.
 
+Oracle scope: this is a schedule-based oracle, not a fully independent
+reimplementation. It calls events.tick_times() - the same deterministic
+tick-generation helper events.py uses to build the actual MQTT message
+stream - to derive expected count-tick timestamps, rather than
+re-deriving tick timing from a second, independent method. A bug in
+tick_times() itself would reproduce identically on both sides and would
+not be caught by count/OEE reconciliation; what full-pipeline
+reconciliation (tests/test_reconciliation.py) does verify independently is
+everything downstream of tick generation - MQTT transport, ingester
+validation/categorisation/storage, and report.py's SQL aggregation.
+
 OEE formulas used throughout this demo (documented here and in README.md):
 
   Planned Production Time = shift duration (8h); no separate break time is
